@@ -5,11 +5,11 @@ import pickle
 import sys
 import threading
 import traceback
+import types
 from enum import Enum
 
 import torch
 import torch.distributed as dist
-
 from torch._C._distributed_rpc import _get_current_rpc_agent
 
 
@@ -83,6 +83,48 @@ class _InternalRPCPickler:
         torch.jit.save(script_module, f)
         return (_InternalRPCPickler._script_module_receiver, (f.getvalue(),))
 
+    @classmethod
+    def _remote_module_receiver(
+        cls,
+        *remote_module_pickled_attrs,
+    ):
+        serialized_remote_module = RemoteModule._make(remote_module_pickled_attrs)
+        m = object.__new__(dist.nn.RemoteModule)  # type: ignore[attr-defined]
+        m.__dict__.update(serialized_remote_module._asdict())
+
+        # Unpickling the attribute `module_rref` must invoke RRef's `_deserialize()` method.
+        m.module_rref = dist.rpc.PyRRef._deserialize(m.module_rref)
+
+        # Install generated methods when unpickled.
+        for method in m.generated_methods:
+            method_name = method.__name__
+            method = torch.jit.export(method)
+            setattr(m, method_name, types.MethodType(method, m))
+
+        return m
+
+    def _remote_module_reducer(self, remote_module):
+        pickled_attrs = {}
+        for k, v in remote_module.__dict__.items():
+            # Pickling the attribute `module_rref` must invoke RRef's `_serialize()` method.
+            if k == "module_rref":
+                pickled_attrs[k] = v._serialize()
+            elif k in dist.nn._REMOTE_MODULE_PICKLED_ATTRIBUTES:  # type: ignore[attr-defined]
+                pickled_attrs[k] = v
+            # Check if unpickled attributes are all in _REMOTE_MODULE_ATTRIBUTES_IGNORE_FOR_PICKLING.
+            elif k not in dist.nn._REMOTE_MODULE_ATTRIBUTES_IGNORE_FOR_PICKLING:  # type: ignore[attr-defined]
+                print(
+                    "The new attribute ``{}`` of RemoteModule is ignored during RPC pickling. "
+                    "To pickle this attribute, it must be either in ``_REMOTE_MODULE_PICKLED_ATTRIBUTES`` or "
+                    "``_REMOTE_MODULE_ATTRIBUTES_IGNORE_FOR_PICKLING``.".format(k),
+                    file=sys.stderr,
+                )
+
+        return (
+            _InternalRPCPickler._remote_module_receiver,
+            tuple(pickled_attrs.values()),
+        )
+
     def serialize(self, obj):
         r"""
         Serialize non tensor data into binary string, tensor data into
@@ -106,6 +148,8 @@ class _InternalRPCPickler:
         # An RRef created locally by RRef Python constructor is type of `rpc.RRef`.
         # Ignore type error because dispatch_table is defined in third-party package
         p.dispatch_table[dist.rpc.RRef] = self._rref_reducer  # type: ignore[index]
+        # Ignore type error because dispatch_table is defined in third-party package
+        p.dispatch_table[dist.nn.RemoteModule] = self._remote_module_reducer  # type: ignore[attr-defined, index]
         # Add dispatch pickling for ScriptModule if needed.
         if isinstance(obj, torch.jit.ScriptModule):
             # Ignore type error because dispatch_table is defined in third-party package
@@ -259,3 +303,17 @@ def _start_record_function(exec_type, func_name, current_worker_name, dest_worke
 
 PythonUDF = collections.namedtuple("PythonUDF", ["func", "args", "kwargs"])
 RemoteException = collections.namedtuple("RemoteException", ["msg", "exception_type"])
+# FIXME: Directly referencing `dist.nn._REMOTE_MODULE_PICKLED_ATTRIBUTES` here can cause
+# "AttributeError: module 'torch.distributed' has no attribute 'nn'".
+# RemoteModule = collections.namedtuple("RemoteModule", dist.nn._REMOTE_MODULE_PICKLED_ATTRIBUTES)
+_REMOTE_MODULE_PICKLED_ATTRIBUTES_LIST = (
+    "on",
+    "device",
+    "is_device_map_set",
+    "is_scriptable",
+    "generated_methods",
+    "module_rref",
+)
+RemoteModule = collections.namedtuple(
+    "RemoteModule", _REMOTE_MODULE_PICKLED_ATTRIBUTES_LIST  # type: ignore[misc]
+)
